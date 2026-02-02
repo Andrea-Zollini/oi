@@ -4,7 +4,7 @@
 # Interactive model selection and chat launcher
 #
 
-set -e
+# Don't use set -e as it causes issues with the interactive menu loop
 
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -104,13 +104,13 @@ show_hardware() {
     local cores=$(echo "$hw" | grep -o '"cpu_cores": [0-9]*' | cut -d' ' -f2)
     
     echo -e "${CYAN}Hardware Profile${NC}"
-    echo -e "${CYAN}──────────────────────────────────────────────────────────${NC}"
+    echo -e "${CYAN}────────────────────────────────${NC}"
     printf "  ${BLUE}GPU:${NC}         %s\n" "${gpu}"
     printf "  ${BLUE}VRAM:${NC}        %.1f GB\n" "${vram}"
     printf "  ${BLUE}CUDA:${NC}        %s\n" "${cuda}"
     printf "  ${BLUE}RAM:${NC}         %s GB\n" "${ram}"
     printf "  ${BLUE}CPU Cores:${NC}   %s\n" "${cores}"
-    echo -e "${CYAN}──────────────────────────────────────────────────────────${NC}"
+    echo -e "${CYAN}────────────────────────────────${NC}"
     
     # Recommendation
     if [ "${cuda}" = "yes" ] && [ "${vram%.*}" -ge 7 ]; then
@@ -324,8 +324,15 @@ list_models() {
             echo "    Min VRAM: ${min_vram} GB"
         elif echo "$line" | grep -q '"description":'; then
             desc=$(echo "$line" | cut -d'"' -f4)
-            echo "    ${desc}"
-            echo ""
+            # Only print if we have a valid model context (id is set)
+            if [ -n "$id" ] && [ -n "$name" ]; then
+                echo "    ${desc}"
+                echo ""
+                # Reset variables for next model
+                id=""
+                name=""
+                min_vram=""
+            fi
         fi
     done
 }
@@ -411,17 +418,13 @@ is_model_in_array() {
     return 1
 }
 
-# Interactive model selection
-interactive_select() {
+# Draw the full menu UI once
+draw_full_menu() {
     # Output all UI to stderr so only the model ID goes to stdout
-    echo "" >&2
-    echo -e "${CYAN}╔════════════════════════════════════════════════════════════╗${NC}" >&2
-    echo -e "${CYAN}║${NC}     ${CYAN}oi${NC} - One-Command LLM Chat Interface              ${CYAN}║${NC}" >&2
-    echo -e "${CYAN}╚════════════════════════════════════════════════════════════╝${NC}" >&2
-    echo "" >&2
-    
+    echo -e "${CYAN}╔════════════════════════════════╗${NC}" >&2
+    echo -e "${CYAN}║${NC}      ${CYAN}oi${NC} - LLM Chat Interface       ${CYAN}║${NC}" >&2
+    echo -e "${CYAN}╚════════════════════════════════╝${NC}" >&2
     show_hardware >&2
-    echo "" >&2
     
     # Get all models and check which are installed
     local models=$(load_models)
@@ -452,7 +455,7 @@ interactive_select() {
     
     # Show single unified menu
     echo -e "${BLUE}Available Models:${NC}" >&2
-    echo -e "${BLUE}──────────────────────────────────────────────────────────${NC}" >&2
+    echo -e "${BLUE}────────────────────────────────${NC}" >&2
     
     local i=1
     for idx in "${!all_ids[@]}"; do
@@ -473,61 +476,104 @@ interactive_select() {
             installed_marker=" ${GREEN}✓ Installed${NC}"
         fi
         
-        printf >&2 "  %-2s %-35s %s%s\n" "$i)" "$name" "$status_str" "$installed_marker"
+        printf >&2 "  %-2s %-28s %s%s\n" "$i)" "$name" "$status_str" "$installed_marker"
         ((i++))
     done
     
-    echo -e "${BLUE}──────────────────────────────────────────────────────────${NC}" >&2
-    echo "" >&2
+    echo -e "${BLUE}────────────────────────────────${NC}" >&2
     echo -e "  ${CYAN}L${NC}) List all available models" >&2
     echo -e "  ${CYAN}H${NC}) Show hardware info" >&2
     echo -e "  ${CYAN}Q${NC}) Quit" >&2
-    echo "" >&2
+}
+
+# Interactive model selection
+interactive_select() {
+    # Draw the full menu once at startup
+    draw_full_menu
     
-    # Read selection
-    echo -e "${CYAN}┌──────────────────────────────────────────────────────────┐${NC}" >&2
-    read -p "│ Enter choice (1-${#all_ids[@]}, L, H, Q): " choice
-    # Clear the input line and draw bottom border on same line
-    echo -e "\r${CYAN}└──────────────────────────────────────────────────────────┘${NC}" >&2
+    # Get all models and check which are installed (needed for the choice handling)
+    local models=$(load_models)
+    local ids=$(echo "$models" | grep '"id":' | cut -d'"' -f4)
+    local installed=()
     
-    case "$choice" in
-        [Ll])
-            list_models
-            return 1
-            ;;
-        [Hh])
-            show_hardware
-            return 1
-            ;;
-        [Qq])
-            exit 0
-            ;;
-        *)
-            if [[ "$choice" =~ ^[0-9]+$ ]]; then
-                local idx=$((choice - 1))
-                
-                # Simple index lookup in unified list
-                if [ $idx -ge 0 ] && [ $idx -lt ${#all_ids[@]} ]; then
-                    local selected_id="${all_ids[$idx]}"
-                    # This goes to stdout - the only thing captured by command substitution
-                    echo "$selected_id"
-                    return 0
+    for id in $ids; do
+        local model_info=$(echo "$models" | grep -A 10 "\"id\": \"${id}\"" | head -10)
+        local template=$(echo "$model_info" | grep '"filename_template":' | head -1 | cut -d'"' -f4)
+        local filename=$(build_filename "$template" "$DEFAULT_QUANT")
+        if is_model_installed "$filename"; then
+            installed+=("$id")
+        fi
+    done
+    
+    # Build single list of all compatible models
+    local compatible=$(get_compatible_models)
+    local all_ids=()
+    local all_names=()
+    local all_status=()
+    
+    while IFS='|' read -r id name status; do
+        [ -z "$id" ] && continue
+        all_ids+=("$id")
+        all_names+=("$name")
+        all_status+=("$status")
+    done <<< "$compatible"
+    
+    # Main interaction loop - only redraws the prompt after L/H commands
+    while true; do
+        # Read selection - only redraw this prompt line
+        echo -e "${CYAN}┌────────────────────────────────┐${NC}" >&2
+        read -p "│ Enter choice (1-${#all_ids[@]}, L, H, Q): " choice
+        # Clear the input line and draw bottom border on same line
+        echo -e "\r${CYAN}└────────────────────────────────┘${NC}" >&2
+        
+        case "$choice" in
+            [Ll])
+                list_models >&2
+                echo "" >&2
+                sleep 2
+                # Continue loop to redraw only the prompt
+                continue
+                ;;
+            [Hh])
+                show_hardware >&2
+                echo "" >&2
+                sleep 1
+                # Continue loop to redraw only the prompt
+                continue
+                ;;
+            [Qq])
+                echo -e "${GREEN}Goodbye!${NC}" >&2
+                return 2
+                ;;
+            *)
+                if [[ "$choice" =~ ^[0-9]+$ ]]; then
+                    local idx=$((choice - 1))
+                    
+                    # Simple index lookup in unified list
+                    if [ $idx -ge 0 ] && [ $idx -lt ${#all_ids[@]} ]; then
+                        local selected_id="${all_ids[$idx]}"
+                        # This goes to stdout - the only thing captured by command substitution
+                        echo "$selected_id"
+                        return 0
+                    else
+                        echo -e "${RED}Invalid selection${NC}" >&2
+                        # Continue loop to redraw only the prompt
+                        continue
+                    fi
                 else
-                    echo -e "${RED}Invalid selection${NC}" >&2
-                    return 1
+                    # Try direct ID
+                    if get_model_info "$choice" > /dev/null; then
+                        echo "$choice"
+                        return 0
+                    else
+                        echo -e "${RED}Unknown model ID: $choice${NC}" >&2
+                        # Continue loop to redraw only the prompt
+                        continue
+                    fi
                 fi
-            else
-                # Try direct ID
-                if get_model_info "$choice" > /dev/null; then
-                    echo "$choice"
-                    return 0
-                else
-                    echo -e "${RED}Unknown model ID: $choice${NC}" >&2
-                    return 1
-                fi
-            fi
-            ;;
-    esac
+                ;;
+        esac
+    done
 }
 
 # Launch chat with selected model
@@ -670,14 +716,18 @@ main() {
     else
         # Interactive mode
         while true; do
-            if selected=$(interactive_select); then
+            selected=$(interactive_select)
+            local select_status=$?
+            
+            if [ $select_status -eq 0 ]; then
+                # User selected a model number
                 launch_chat "$selected" "$quant" "$context" "$threads"
                 break
+            elif [ $select_status -eq 2 ]; then
+                # User selected Q to quit
+                exit 0
             fi
-            # If interactive_select returns 1, it showed info and wants to loop
-            echo ""
-            read -p "Press Enter to continue..."
-            clear
+            # Otherwise (status 1), loop continues for L or H selection
         done
     fi
 }
